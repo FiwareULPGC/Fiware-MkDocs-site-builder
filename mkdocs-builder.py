@@ -1,5 +1,107 @@
 #! /usr/bin/env python
 
+def convert_to_md(src, dest, src_ext):
+  """ Utility to convert from the desired input format to markdown. It will also change links inside the file. """
+  print "INFO\t-  Converting file %s to markdown syntax." % src
+
+  # Compile the command
+  markdown_dest = dest.replace("."+src_ext, ".md")
+
+  if src_ext == 'rst':
+    from_format = 'rst'    
+
+  command = ["pandoc", "--from="+from_format, "--to=markdown", "--output=%s"%markdown_dest, src]
+  subprocess.Popen(command, stderr=subprocess.PIPE).communicate()
+
+  # Find the links to be changed in the newly converted file and cahnge them to md references
+  with open(markdown_dest, "r") as infile:
+    content = infile.read()
+
+  regex_str="\[(.+)\]\((.+)\."+src_ext+"(#.*)?\)"
+  reference_regex = re.compile(regex_str)
+
+  references_to_change = reference_regex.findall(content)
+
+  if references_to_change:
+    for reference in references_to_change:
+      link_text = reference[0]
+      page      = reference[1]
+      section   =  reference[2]
+      
+      original_ref = "[%s](%s%s)" % ( link_text, page+"."+src_ext, section)
+      new_ref = "[%s](%s%s)" % ( link_text, page+".md", section)
+
+      content = content.replace(original_ref, new_ref)
+
+    with open(markdown_dest, "w") as outfile:
+      outfile.write(content)
+
+# end convert_to_md
+
+def copy_convert(src, dest):
+  """ Utility to copy repo files and folders. When a file is not in markdown format, we make a conversion instead of a plain copy. """
+  try:
+    shutil.copytree(src, dest)
+  except OSError as e:
+    # If the error was caused because the source wasn't a directory
+    if e.errno == errno.ENOTDIR:
+      if dest.split(".")[-1] == "rst":
+        convert_to_md(src, dest, 'rst')
+      else:
+        shutil.copy(src, dest)
+    elif e.errno == errno.EEXIST:
+
+      return
+    else:
+      print('WARNING\t-  Directory not copied. Error: %s' % e)
+# end copy_convert
+
+def step( source_target_root_folders, dirname, names ):
+  # Ignore .git and .gitignore folders
+  if dirname.find("/.git") != -1:
+    return
+
+  source_root_folder = source_target_root_folders[0]
+  target_root_folder = source_target_root_folders[1]
+  
+  for name in names:
+    # Substitute README files for index version
+    if os.path.basename(name).split('.')[0] == 'README':
+      target_name=name.replace("README", "index")
+    else: 
+      target_name = name
+
+    src = os.path.normpath( os.path.join( source_root_folder, dirname, name ) )
+    dest = os.path.normpath( os.path.join( target_root_folder, dirname, target_name ) )
+
+    copy_convert( src, dest )
+# end step
+
+def change_pages_extension( pages ):
+  """ Utility to normalise index configuration pages into md files """
+  out_pages=[]
+
+  for i in xrange(len(pages)):
+    out_name = {}
+    for name in pages[i]:
+      try:
+        if pages[i][name].split(".")[-1]=="rst":
+          out_name[name] = pages[i][name].replace(".rst", ".md")
+        else:
+          out_name[name] = pages[i][name]
+
+        if pages[i][name].split(".")[0]=="README":
+          out_name[name] = "index.md"
+
+      # Call recursively if a list of subpages is found
+      except AttributeError as e:
+        out_name[name] = change_pages_extension( pages[i][name] ) 
+
+      out_pages.append( out_name )
+
+  return out_pages
+# end change_pages_extension
+
 def clean_duplicate_lines(lines):
   """ Utility to clean duplicate lines from a list """
   seen = set()
@@ -111,6 +213,11 @@ def compile_single(repo_path, extra_conf=None, output_folder=None):
       ( repo_path+"/mkdocs.yml", compiled_site_root_folder )
   conf["site_dir"] = compiled_site_root_folder
 
+
+  if "pages" in conf:
+    conf["pages"] =  change_pages_extension(conf["pages"])
+
+
   if extra_conf:
     conf["subsites"]=[]
     
@@ -130,35 +237,22 @@ def compile_single(repo_path, extra_conf=None, output_folder=None):
   
   sh.mkdir("-p", compiled_site_root_folder)
 
-  # Make symlinks to the repo documentaction files into the build folder
-  # TODO: Refactor to os.walk
-  readme_files = sh.grep( sh.find(repo_path, "-mindepth", 1, "-maxdepth", 100, "-type", "f"), ".md" )
+  # Copy or convert (if not in markdown) the files from the original repo to the build directory
+  source_path=repo_path
+  target_path=build_folder+'docs'
 
-  for filename in readme_files:
-    filename=filename.rstrip('\n')
+  origin_directory = str( sh.pwd() ).rstrip('\n')
+  sh.cd( source_path )
 
-    # We remove the prefixed path to the repo 
-    relative_path_filename = filename[len(repo_path+'/'):]
+  os.path.walk('./', step, [source_path, target_path])
 
-    # The README file at root level will be the MkDocs index.md
-    if relative_path_filename == 'README.md':
-      target = build_folder+'docs/index.md'
-    else:
-      relative_path_folder = str(sh.dirname(relative_path_filename)).rstrip('\n')
-      target = build_folder+'docs/'+relative_path_folder
-      sh.mkdir("-p", target)
-      target = build_folder+'docs/'+relative_path_filename
-
-    # Do the symlink  
-    sh.ln("-s", filename, target)
-
+  sh.cd( origin_directory )
 
   origin_directory = str( sh.pwd() ).rstrip('\n')
 
   sh.cd( build_folder )
 
-  # Our return value will be the error output from MkDocs
-
+  # The return value will be the error output from MkDocs
   [ _, execution_output ] = subprocess.Popen(["mkdocs", "build", "--clean"], stderr=subprocess.PIPE).communicate()
 
   sh.cd( origin_directory )
@@ -227,8 +321,8 @@ def compile_multi_command(repo_path, output_folder=None):
   subsites_dir = normalise_folder_paths( conf['subsites_dir'] )
 
   subsites_dirs=[]
-  for dirpath, dirnames, filenames in os.walk(repo_path+subsites_dir):
-    for dirname in dirnames:
+  for dir_name, subdir_list, file_list in os.walk(repo_path+subsites_dir):
+    for dirname in subdir_list:
       subsites_dirs.append( subsites_dir+dirname )
     break
 
@@ -390,6 +484,8 @@ if __name__ == '__main__':
   import re
   import pprint
   import inspect
+  import shutil
+  import errno
 
   conf_folder, build_folder, default_theme_folder = setup_script()
 

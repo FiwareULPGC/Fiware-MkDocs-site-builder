@@ -1,0 +1,5 @@
+#ignore folder
+docs/
+compiled_sites/
+conf/
+.tmp_build/
